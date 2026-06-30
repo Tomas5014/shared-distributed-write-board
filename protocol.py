@@ -65,6 +65,12 @@ ACTION_DESELECT = "DESELECT"
 
 NS_HOST            = os.environ.get("SDWB_NS_HOST", "127.0.0.1")
 NS_PORT            = int(os.environ.get("SDWB_NS_PORT", "9999"))
+NS_BIND_HOST       = os.environ.get("SDWB_NS_BIND", "0.0.0.0")
+# NS_HOST  = endereço que TODOS (cliente e o próprio NS) usam para DISCAR o NS.
+# NS_BIND_HOST = endereço em que o PROCESSO do NS efetivamente ESCUTA.
+# Por padrão escuta em todas as interfaces (0.0.0.0), mesmo que NS_HOST
+# aponte para um IP específico — assim "esquecer" de configurar o bind não
+# deixa o serviço acessível só em loopback.
 
 HEARTBEAT_INTERVAL = 4    # T: segundos entre envios de heartbeat
 HEARTBEAT_TIMEOUT  = 8    # 2T: segundos sem resposta -> peer considerado morto
@@ -149,12 +155,52 @@ def free_port() -> int:
 
 
 def local_ip() -> str:
-    """Retorna o IP LAN desta máquina."""
+    """Retorna o IP LAN desta máquina.
+
+    Em redes sem rota de internet (ex.: dois PCs ligados direto por cabo
+    Ethernet, sem gateway), a técnica clássica de "conectar via UDP a
+    8.8.8.8 e ver qual IP local o SO escolheu" pode falhar, pois não há
+    rota até esse endereço — caindo no fallback 127.0.0.1, que é inútil
+    para qualquer outra máquina. Para evitar isso, tentamos várias
+    estratégias em ordem, e nunca aceitamos 127.0.0.1 se houver alternativa.
+    """
+    override = os.environ.get("SDWB_MY_IP")
+    if override:
+        return override
+
+    candidates = []
+
+    # 1) Tenta rotear em direção ao próprio Serviço de Nomes — funciona
+    #    mesmo sem gateway de internet, desde que NS_HOST esteja configurado
+    #    para um IP real (não 127.0.0.1) nesta máquina.
+    if NS_HOST and NS_HOST != "127.0.0.1":
+        try:
+            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            s.connect((NS_HOST, NS_PORT))
+            candidates.append(s.getsockname()[0])
+            s.close()
+        except Exception:
+            pass
+
+    # 2) Truque clássico via DNS público (só funciona com internet/gateway)
     try:
         s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         s.connect(("8.8.8.8", 80))
-        ip = s.getsockname()[0]
+        candidates.append(s.getsockname()[0])
         s.close()
-        return ip
     except Exception:
-        return "127.0.0.1"
+        pass
+
+    for ip in candidates:
+        if ip and not ip.startswith("127."):
+            return ip
+
+    # 3) Último recurso: resolve o próprio hostname
+    try:
+        ip = socket.gethostbyname(socket.gethostname())
+        if ip and not ip.startswith("127."):
+            return ip
+    except Exception:
+        pass
+
+    return "127.0.0.1"

@@ -22,7 +22,7 @@ import threading
 import time
 
 from protocol import (
-    NS_HOST, NS_PORT, OK, ERROR_MSG, NS_PROBE,
+    NS_HOST, NS_PORT, NS_BIND_HOST, OK, ERROR_MSG, NS_PROBE,
     REGISTER_BOARD, LIST_BOARDS, UPDATE_BOARD, REMOVE_BOARD,
     send_msg, recv_msg, one_shot,
 )
@@ -127,4 +127,4 @@ class NameService:
 
 if __name__ == "__main__":
     port = int(sys.argv[1]) if len(sys.argv) > 1 else NS_PORT
-    NameService(NS_HOST if NS_HOST else "0.0.0.0", port).start()
+    NameService(NS_BIND_HOST, port).start()
