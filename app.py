@@ -155,6 +155,7 @@ class App:
         tk.Button(toolbar, text="Colorir (cor 2)", bg=PALETTE[1], fg="white",
                   command=lambda: self._on_color(PALETTE[1])).pack(side="left", padx=4)
         tk.Button(toolbar, text="Remover", command=self._on_remove).pack(side="left", padx=4)
+        tk.Button(toolbar, text="Desselecionar", command=self._on_deselect).pack(side="left", padx=4)
 
         body = tk.Frame(self.root)
         body.pack(fill="both", expand=True, padx=8, pady=4)
@@ -231,6 +232,15 @@ class App:
             messagebox.showinfo("Remover", "Selecione um objeto primeiro (botão Selecionar).")
             return
         self.node.do_action("REMOVE", {"object_id": oid})
+
+    def _on_deselect(self):
+        oid = self._current_selected_object()
+        if oid is None:
+            messagebox.showinfo("Desselecionar", "Você não tem nenhum objeto selecionado.")
+            return
+        # Libera a trava de exclusão mútua: o objeto volta a ficar disponível
+        # para os demais clientes selecionarem.
+        self.node.do_action("DESELECT", {"object_id": oid})
 
     def _on_leave(self):
         self.node.leave_board()

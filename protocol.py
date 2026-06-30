@@ -34,12 +34,12 @@ CLIENT_LEFT     = "CLIENT_LEFT"
 ERROR_MSG       = "ERROR"
 OK              = "OK"
 
-# Protocolo de Commit em Duas Fases (2PC) — Coordenador ⇄ Clientes (participantes)
-PREPARE         = "PREPARE"        # coordenador -> participantes: vote nesta ação
-VOTE_COMMIT     = "VOTE_COMMIT"    # participante -> coordenador
-VOTE_ABORT      = "VOTE_ABORT"     # participante -> coordenador
-TX_COMMIT       = "TX_COMMIT"      # coordenador -> todos: ação confirmada, aplicar
-TX_ABORT        = "TX_ABORT"       # coordenador -> todos (ou só ao requisitante): ação cancelada
+# Replicação primário-backup (sequenciador central) — Coordenador -> Clientes
+# O coordenador é o PRIMÁRIO: serializa, valida (exclusão mútua) e aplica a ação
+# no estado canônico, então propaga o resultado às réplicas (backups). Não há
+# fase de votação — em caso de conflito o coordenador responde apenas ERROR ao
+# requisitante e nada é propagado.
+ACTION_APPLY    = "ACTION_APPLY"   # coordenador -> todos: aplique esta ação confirmada
 
 # Nó ↔ Nó  (eleição)
 ELECTION          = "ELECTION"
@@ -76,7 +76,6 @@ HEARTBEAT_INTERVAL = 4    # T: segundos entre envios de heartbeat
 HEARTBEAT_TIMEOUT  = 8    # 2T: segundos sem resposta -> peer considerado morto
 ELECTION_TIMEOUT   = 6    # segundos aguardando COORDINATOR_WIN antes de reiniciar eleição
 ELECTION_CONTACT_TIMEOUT = 4   # segundos aguardando resposta a uma mensagem ELECTION
-VOTE_TIMEOUT        = 4   # segundos aguardando votos de cada participante no 2PC
 
 # ─────────────────────────────────────────────────────────────────────────────
 # I/O de mensagens

@@ -4,7 +4,7 @@ test_headless.py — Validação automatizada da lógica de rede do SDWB (sem GU
 Roda o Serviço de Nomes e vários Nodes dentro do mesmo processo Python
 (threads + sockets reais em localhost) e exercita:
   1. Criação de quadro + ingresso de múltiplos clientes + sincronização de estado
-  2. Propagação de desenhos (2PC) entre réplicas
+  2. Propagação de desenhos (replicação primário-backup) entre réplicas
   3. Exclusão mútua em SELECT concorrente
   4. Detecção de falha do coordenador + eleição do Valentão + atualização do NS
   5. Continuidade das operações com o novo coordenador
@@ -68,10 +68,10 @@ def main():
     check("Todos veem 3 membros (sincronização de entrada)",
           len(A.members) == 3 and len(B.members) == 3 and len(C.members) == 3)
 
-    # ---- 3. Desenho propaga via 2PC ----
+    # ---- 3. Desenho propaga via replicação primário-backup ----
     A.do_action("LINE", {"points": [[10, 10], [100, 100]]})
     propagated = wait_until(lambda: len(B.board.objects) == 1 and len(C.board.objects) == 1)
-    check("Linha desenhada por Alice propaga para Bob e Carol (2PC commit)", propagated)
+    check("Linha desenhada por Alice propaga para Bob e Carol (ACTION_APPLY)", propagated)
 
     obj_id = next(iter(A.board.objects.keys()))
     check("Objeto replicado é idêntico (mesmo id) nas 3 réplicas",

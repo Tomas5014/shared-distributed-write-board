@@ -23,7 +23,7 @@ O sistema é composto por três tipos de processo:
               │  Papel de CLIENTE (sempre):          │
               │   • Réplica local: board + members   │
               │   • Envia ACTION_REQUEST              │
-              │   • Participa de 2PC (vota)          │
+              │   • Aplica ACTION_APPLY (réplica)    │
               │   • Heartbeat com o coordenador      │
               │   • Detecta falha → eleição Bully    │
               │                                      │
@@ -31,7 +31,8 @@ O sistema é composto por três tipos de processo:
               │  eleição ou criou o quadro):         │
               │   • Estado canônico (coord_board)    │
               │   • Tabela autoritativa (coord_members)│
-              │   • Orquestra 2PC                    │
+              │   • Primário: ordena/valida/aplica   │
+              │     e propaga ACTION_APPLY            │
               │   • Envia Heartbeat aos clientes     │
               └──────────────────────────────────────┘
               GUI: app.py (Tkinter, processo separado do coordenador)
@@ -61,7 +62,6 @@ Framing TCP: `[4 bytes big-endian = tamanho] + [payload UTF-8 JSON]`
 | `JOIN` | `client_id` (None se novo), `ip`, `port`, `name` |
 | `ACTION_REQUEST` | `action`, `payload` |
 | `HEARTBEAT_ACK` | — |
-| `VOTE_COMMIT` / `VOTE_ABORT` | `tx_id` |
 | `LEAVE` | — |
 
 ### 2.3 Coordenador → Cliente
@@ -71,10 +71,8 @@ Framing TCP: `[4 bytes big-endian = tamanho] + [payload UTF-8 JSON]`
 | `STATE_SYNC` | `client_id`, `board`, `members` |
 | `HEARTBEAT` | — |
 | `CLIENT_JOINED` / `CLIENT_LEFT` | `members` |
-| `PREPARE` | `tx_id`, `action`, `payload`, `client_id` |
-| `TX_COMMIT` | `tx_id`, `action`, `payload`, `client_id`, `result` |
-| `TX_ABORT` | `tx_id`, `reason` |
-| `ERROR` | `error` |
+| `ACTION_APPLY` | `action`, `payload`, `client_id`, `result` |
+| `ERROR` | `error` (ação rejeitada por conflito de exclusão mútua) |
 
 ### 2.4 Nó ↔ Nó (Eleição)
 
@@ -119,29 +117,46 @@ O `STATE_SYNC` contém o estado completo do quadro (`board_state.to_dict()`) e a
 
 ---
 
-## 5. Protocolo 2PC — Commit em Duas Fases (node.py)
+## 5. Propagação de Ações — Replicação Primário-Backup (node.py)
 
-Usado em **todas** as ações de desenho/seleção/colorir/remover. Garante que a ação ou é aplicada em **todos** os nós ou em **nenhum**.
+> **Nota de escopo:** o enunciado original pedia *Two-Phase Commit (2PC)* para
+> transações atômicas de múltiplos objetos, mas essa exigência **foi removida
+> pelo professor**. Como não há mais transações multi-objeto, adotamos um
+> esquema mais simples e adequado: **replicação primário-backup com
+> sequenciador central**. O coordenador é o **primário** (réplica autoritativa);
+> os clientes são **backups** (réplicas passivas).
+
+Usado em **todas** as ações de desenho/seleção/colorir/remover/desselecionar.
 
 ```
-    Requisitante    Coordenador    Participante 1   Participante N
-         │               │               │               │
-         │─ACTION_REQUEST▶│               │               │
-         │               │──PREPARE──────▶───────────────▶│
-         │               │◀──VOTE_COMMIT──◀──VOTE_COMMIT──│
-         │               │   (ou ABORT)      (ou ABORT)   │
-         │               │                                 │
-         │     [todos COMMIT]                              │
-         │◀──TX_COMMIT────│──TX_COMMIT────▶───────────────▶│
-         │   [aplica]     │   [aplica]    [aplica]  [aplica]│
-         │               │                                 │
-         │     [algum ABORT ou timeout]                    │
-         │◀──TX_ABORT─────│                                 │
+    Requisitante    Coordenador (primário)     Backup 1   Backup N
+         │               │                        │          │
+         │─ACTION_REQUEST▶│                        │          │
+         │            [action_lock]                │          │
+         │            valida (exclusão mútua)       │          │
+         │               │                          │          │
+         │   [válida] aplica em coord_board         │          │
+         │◀──ACTION_APPLY─│──ACTION_APPLY──────────▶──────────▶│
+         │   [aplica]     │        [aplica]      [aplica]      │
+         │               │                          │          │
+         │   [conflito] ──┐                          │          │
+         │◀──ERROR────────┘  (só ao requisitante; nada propaga) │
 ```
 
-**Exclusão mútua:** O coordenador usa `tx_lock` (RLock) para serializar ACTION_REQUESTs, garantindo que transações concorrentes sejam ordenadas totalmente. Detectada na fase de validação (`board_state.validate()`): se um objeto já está selecionado por outro cliente, `VOTE_ABORT` é emitido imediatamente.
+**Sequenciador central / ordenação total:** o coordenador processa cada
+`ACTION_REQUEST` sob `action_lock` (RLock). Ações concorrentes de clientes
+diferentes são serializadas — a segunda enxerga o efeito da primeira. Ações de
+um mesmo cliente preservam ordem FIFO porque são lidas e aplicadas inline na
+conexão daquele cliente.
 
-**Deadlock de head-of-line evitado:** Cada `ACTION_REQUEST` é processado em uma thread separada no coordenador, para que a leitura de votos de outros clientes (na mesma conexão) não seja bloqueada pela espera de votos para a transação atual.
+**Exclusão mútua:** validada em `board_state.validate()` antes de aplicar. Se o
+objeto já está selecionado por outro cliente, o coordenador responde apenas
+`ERROR` ao requisitante e **não propaga nada** — o estado canônico não muda.
+
+**Consistência das réplicas:** como só o primário muta o estado e propaga as
+ações já confirmadas, na mesma ordem total, todas as réplicas convergem para o
+mesmo estado. Não há votação nem fase de *abort*: uma ação válida sempre é
+aplicada por todos; uma inválida não é aplicada por ninguém.
 
 ---
 
@@ -197,8 +212,8 @@ Para evitar que o nó que hospeda o coordenador aplique ações duas vezes:
 
 | Atributo | Dono | Descrição |
 |----------|------|-----------|
-| `coord_board` | Coordenador | Estado canônico; modificado pelo 2PC |
-| `board` | Cliente | Réplica local; atualizada apenas via `TX_COMMIT` recebido |
+| `coord_board` | Coordenador | Estado canônico (primário); modificado ao validar/aplicar a ação |
+| `board` | Cliente | Réplica local (backup); atualizada apenas via `ACTION_APPLY` recebido |
 | `coord_members` | Coordenador | Tabela autoritativa de membros |
 | `members` | Cliente | Réplica da lista; atualizada via `STATE_SYNC` / `CLIENT_JOINED` / `CLIENT_LEFT` |
 
@@ -233,6 +248,70 @@ python3 app.py
 
 O primeiro cliente que clicar em **CRIAR NOVO QUADRO** passa a hospedar o coordenador daquele quadro. Os demais clicam em **INGRESSAR EM QUADRO EXISTENTE**, selecionam o quadro na lista e entram.
 
+### Passo 3 — Dois PCs ligados direto por cabo Ethernet
+
+Cenário sem roteador/DHCP. Exemplo: **PC-A = `192.168.50.1`** (roda o Serviço de Nomes) e **PC-B = `192.168.50.2`**.
+
+**Pré-requisitos (nos dois):** o código do projeto na máquina, Python 3.10+ e Tkinter
+(`sudo apt install python3-tk` no Debian/Ubuntu).
+
+**1. Cabo + IPs estáticos na mesma sub-rede** (Ethernet moderno tem Auto-MDI-X, cabo
+comum serve). Descubra o nome da interface com `ip -br link` (ex.: `enp3s0`) e troque abaixo:
+
+```bash
+# No PC-A
+sudo ip addr add 192.168.50.1/24 dev enp3s0
+sudo ip link set enp3s0 up
+# No PC-B
+sudo ip addr add 192.168.50.2/24 dev enp3s0
+sudo ip link set enp3s0 up
+```
+> Comandos temporários (somem ao reiniciar); suficientes para a demonstração.
+
+**2. Testar a conexão** (não prossiga enquanto o ping não responder):
+```bash
+# No PC-A
+ping 192.168.50.2
+```
+
+**3. Serviço de Nomes — só no PC-A:**
+```bash
+export SDWB_NS_HOST=192.168.50.1
+export SDWB_NS_PORT=9999
+export SDWB_MY_IP=192.168.50.1
+python3 name_service.py            # deve imprimir: ouvindo em 0.0.0.0:9999
+```
+
+**4. Cliente no PC-A (outro terminal)** — clica em CRIAR NOVO QUADRO:
+```bash
+export SDWB_NS_HOST=192.168.50.1
+export SDWB_NS_PORT=9999
+export SDWB_MY_IP=192.168.50.1
+python3 app.py
+```
+
+**5. Cliente no PC-B** — clica em INGRESSAR EM QUADRO EXISTENTE:
+```bash
+export SDWB_NS_HOST=192.168.50.1   # aponta para o NS, que está no PC-A
+export SDWB_NS_PORT=9999
+export SDWB_MY_IP=192.168.50.2     # o MEU ip nesta máquina
+python3 app.py
+```
+
+**`SDWB_MY_IP` é a variável-chave deste cenário.** Cada nó precisa anunciar ao Serviço
+de Nomes / coordenador um IP que a *outra* máquina consiga discar. Numa ligação direta
+sem gateway a detecção automática pode falhar e cair em `127.0.0.1` (inútil para o outro
+PC). Por isso defina `SDWB_MY_IP` explicitamente em cada máquina com o IP daquela placa —
+o código usa essa variável antes de qualquer heurística.
+
+**Firewall:** as portas dos nós são aleatórias a cada execução (o SO escolhe uma livre),
+então não há porta fixa a liberar além da do NS. Num cabo direto entre máquinas confiáveis,
+libere a sub-rede ou desative o firewall durante o teste:
+```bash
+sudo ufw allow from 192.168.50.0/24    # ou, para o teste: sudo ufw disable
+```
+No Windows, libere o `python.exe` no Firewall para redes privadas (ou desative-o na rede privada).
+
 ### Cenários de Teste Obrigatórios
 
 | Cenário | Como testar |
@@ -245,7 +324,7 @@ O primeiro cliente que clicar em **CRIAR NOVO QUADRO** passa a hospedar o coorde
 ```bash
 python3 test_headless.py
 ```
-Exercita todos os mecanismos sem Tkinter: cria 3 nós, testa 2PC, exclusão mútua, eleição Bully, recuperação de estado e regra do coordenador sozinho. Resultado esperado: **20/20 PASS**.
+Exercita todos os mecanismos sem Tkinter: cria 3 nós, testa a propagação por replicação primário-backup, exclusão mútua, eleição Bully, recuperação de estado e regra do coordenador sozinho. Resultado esperado: **20/20 PASS**.
 
 ---
 
@@ -256,7 +335,7 @@ sdwb/
 ├── protocol.py        Constantes de mensagens, framing TCP, helpers de socket
 ├── board_state.py     Estado do quadro: objetos, validação, aplicação de ações
 ├── name_service.py    Serviço de Nomes (processo separado, endereço fixo)
-├── node.py            Núcleo do nó: coordenador + cliente + 2PC + eleição Bully
+├── node.py            Núcleo do nó: coordenador + cliente + replicação + eleição Bully
 ├── app.py             Interface gráfica Tkinter (cliente)
 └── test_headless.py   Bateria de testes automatizados (sem GUI)
 ```

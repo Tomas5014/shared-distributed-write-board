@@ -16,7 +16,6 @@ separada da interface, como pede o enunciado (1.1 — "interface é do cliente")
 import socket
 import threading
 import time
-import uuid
 from typing import Callable, Optional
 
 from board_state import BoardState
@@ -60,16 +59,15 @@ class Node:
 
         # ---- papel de COORDENADOR (se este nó hospeda um quadro) ----
         self.is_coordinator = False
-        self.coord_board = BoardState()           # estado CANÔNICO (só tocado pela lógica de 2PC)
+        self.coord_board = BoardState()           # estado CANÔNICO (primário; só o coordenador o muda)
         self.coord_members: dict[str, dict] = {}  # tabela AUTORITATIVA de membros (só tocada pelo coordenador)
         self.board_name: Optional[str] = None
         self.next_client_id = 1
         self.conns: dict[str, socket.socket] = {}
         self.conn_locks: dict[str, threading.Lock] = {}
         self.last_ack: dict[str, float] = {}
-        self.tx_lock = threading.RLock()            # serializa ACTION_REQUEST -> exclusão mútua total
+        self.action_lock = threading.RLock()        # serializa ACTION_REQUEST -> ordenação total + exclusão mútua
         self.members_lock = threading.RLock()
-        self.pending_tx: dict[str, dict] = {}
 
         # ---- eleição ----
         self.election_lock = threading.Lock()
@@ -129,7 +127,17 @@ class Node:
         return ok, err
 
     def join_board(self, name: str, ip: str, port: int) -> tuple[bool, str]:
-        self.is_coordinator = False
+        # Caso especial: reentrar no PRÓPRIO quadro que eu hospedo. Quando o
+        # coordenador "sai" para o menu mas ainda há outros participantes, ele
+        # continua hospedando em segundo plano (is_coordinator permanece True,
+        # heartbeat e listener seguem rodando). Se ele agora reentra escolhendo
+        # esse mesmo quadro na lista, NÃO podemos zerar is_coordinator: isso
+        # derrubaria o heartbeat/atendimento dos demais clientes e faria o
+        # próprio listener rejeitar o nosso JOIN ("este nó não é o coordenador").
+        # Basta restabelecer a conexão de cliente (loopback).
+        rejoining_own = (self.is_coordinator and ip == self.my_ip and port == self.my_port)
+        if not rejoining_own:
+            self.is_coordinator = False
         self.board_name = name
         self.coord_ip, self.coord_port = ip, port
         self.client_id = None
@@ -283,19 +291,14 @@ class Node:
                 break
             mtype = msg.get("type")
             if mtype == P.ACTION_REQUEST:
-                # IMPORTANTE: processar em thread própria, sem bloquear este loop.
-                # _coord_handle_action_request pode ficar até VOTE_TIMEOUT segundos
-                # esperando votos de OUTROS clientes — inclusive deste, para
-                # transações de terceiros. Se processássemos aqui (na mesma thread
-                # que lê as respostas de voto desta conexão), uma ação própria do
-                # cliente travaria a leitura do voto dele para a transação de outro
-                # cliente, gerando um deadlock de "head-of-line blocking".
-                threading.Thread(target=self._coord_handle_action_request,
-                                  args=(cid, msg), daemon=True).start()
+                # Processado inline nesta conexão: garante ordem FIFO das ações
+                # de um mesmo cliente. A ordenação TOTAL entre clientes diferentes
+                # é dada por action_lock dentro de _coord_handle_action_request.
+                # (Sem o 2PC não há mais espera por votos, então não há risco de
+                # bloqueio "head-of-line" como antes.)
+                self._coord_handle_action_request(cid, msg)
             elif mtype == P.HEARTBEAT_ACK:
                 self.last_ack[cid] = time.time()
-            elif mtype == P.VOTE_COMMIT or mtype == P.VOTE_ABORT:
-                self._coord_record_vote(msg["tx_id"], cid, mtype)
             elif mtype == P.LEAVE:
                 break
         # Só limpa e notifica os outros se ainda estamos em operação normal.
@@ -337,10 +340,30 @@ class Node:
         if not existed:
             return
         _safe_close(conn)
+        # Libera qualquer objeto que o cliente que saiu tinha selecionado —
+        # senão a trava de exclusão mútua ficaria presa para sempre (inclusive
+        # impedindo o próprio nó de re-selecioná-lo ao voltar com novo id).
+        if remaining > 0:
+            self._coord_release_selections_of(int(cid))
         self._coord_broadcast({"type": P.CLIENT_LEFT, "members": members_snapshot})
         self.on_members_update()
         if remaining == 0:
             self._kill_hosted_board()
+
+    def _coord_release_selections_of(self, client_int_id: int):
+        """Desseleciona, no estado canônico, todos os objetos travados por um
+        cliente que deixou o quadro, e propaga a liberação às réplicas via
+        ACTION_APPLY (mesmo caminho de qualquer outra ação confirmada)."""
+        with self.action_lock:
+            freed = [oid for oid, obj in self.coord_board.objects.items()
+                     if obj.get("selected_by") == client_int_id]
+            for oid in freed:
+                self.coord_board.apply("DESELECT", {"object_id": oid}, client_int_id)
+                self._coord_broadcast({
+                    "type": P.ACTION_APPLY, "action": "DESELECT",
+                    "payload": {"object_id": oid}, "client_id": client_int_id,
+                    "result": {"object_id": oid},
+                })
 
     def _kill_hosted_board(self):
         """Regra das anotações: coordenador sozinho que sai/cai mata o quadro."""
@@ -370,60 +393,33 @@ class Node:
                     self.on_status(f"Cliente {cid} não respondeu a tempo — removendo.")
                     self._coord_remove_client(cid)
 
-    # ---- 2PC (Commit em Duas Fases) ----
+    # ---- Replicação primário-backup (sequenciador central) ----
 
     def _coord_handle_action_request(self, cid: str, msg: dict):
+        """O coordenador (primário) é o ponto único de serialização: valida a
+        ação contra o estado canônico (exclusão mútua), aplica-a e propaga o
+        resultado a TODAS as réplicas. `action_lock` dá ordenação total entre
+        ações de clientes diferentes — dois pedidos conflitantes simultâneos
+        são processados um de cada vez, e o segundo vê o efeito do primeiro."""
         action, payload = msg["action"], msg["payload"]
-        with self.tx_lock:   # garante ordenação total -> exclusão mútua entre transações concorrentes
+        with self.action_lock:
             ok, err = self.coord_board.validate(action, payload, int(cid))
             if not ok:
+                # Conflito (ex.: objeto já selecionado por outro) -> só o
+                # requisitante recebe o erro; nada é propagado.
                 self._coord_send(cid, {"type": P.ERROR_MSG, "error": err})
                 return
 
-            tx_id = str(uuid.uuid4())
-            with self.members_lock:
-                participants = [c for c in self.coord_members.keys() if c != cid]
-            event = threading.Event()
-            self.pending_tx[tx_id] = {"event": event, "votes": {}, "expected": set(participants)}
-
-            # ---- Fase 1: PREPARE ----
-            for pcid in participants:
-                self._coord_send(pcid, {
-                    "type": P.PREPARE, "tx_id": tx_id, "action": action,
-                    "payload": payload, "client_id": int(cid),
-                })
-            if participants:
-                event.wait(P.VOTE_TIMEOUT)
-
-            entry = self.pending_tx.pop(tx_id, {"votes": {}, "expected": set(participants)})
-            votes, expected = entry["votes"], entry["expected"]
-            aborted = (any(v == P.VOTE_ABORT for v in votes.values())
-                       or len(votes) < len(expected))
-
-            if aborted:
-                reason = "conflito detectado durante a votação" if votes else "participante não respondeu a tempo"
-                self._coord_send(cid, {"type": P.TX_ABORT, "tx_id": tx_id, "reason": reason})
-                return
-
-            # ---- Fase 2: COMMIT ----
-            # Aplica somente ao estado CANÔNICO (coord_board). A réplica de cliente
-            # deste mesmo nó (self.board, usada pela GUI) só é atualizada quando o
-            # TX_COMMIT chega pela conexão de loopback, em _client_reader_loop —
-            # exatamente o mesmo caminho usado por todos os outros clientes. Isso
-            # evita aplicar a ação duas vezes no nó que hospeda o coordenador.
+            # Aplica ao estado CANÔNICO (coord_board) e propaga a todos.
+            # A réplica de cliente deste mesmo nó (self.board, usada pela GUI) só
+            # é atualizada quando o ACTION_APPLY chega pela conexão de loopback,
+            # em _client_reader_loop — o mesmo caminho de todos os outros
+            # clientes. Isso evita aplicar a ação duas vezes no nó coordenador.
             result = self.coord_board.apply(action, payload, int(cid))
-            commit_msg = {"type": P.TX_COMMIT, "tx_id": tx_id, "action": action,
-                          "payload": payload, "client_id": int(cid), "result": result}
-            self._coord_send(cid, commit_msg)
-            self._coord_broadcast(commit_msg, exclude=cid)
-
-    def _coord_record_vote(self, tx_id: str, cid: str, vote: str):
-        entry = self.pending_tx.get(tx_id)
-        if entry is None:
-            return
-        entry["votes"][cid] = vote
-        if len(entry["votes"]) >= len(entry["expected"]):
-            entry["event"].set()
+            update = {"type": P.ACTION_APPLY, "action": action,
+                      "payload": payload, "client_id": int(cid), "result": result}
+            self._coord_send(cid, update)
+            self._coord_broadcast(update, exclude=cid)
 
     # ════════════════════════════════════════════════════════════════════
     # PAPEL DE CLIENTE
@@ -483,20 +479,11 @@ class Node:
                 except Exception:
                     break
 
-            elif mtype == P.PREPARE:
-                ok, _err = self.board.validate(msg["action"], msg["payload"], msg["client_id"])
-                vote = P.VOTE_COMMIT if ok else P.VOTE_ABORT
-                try:
-                    self._client_send({"type": vote, "tx_id": msg["tx_id"]})
-                except Exception:
-                    break
-
-            elif mtype == P.TX_COMMIT:
+            elif mtype == P.ACTION_APPLY:
+                # O primário (coordenador) já confirmou a ação; aplicamos na
+                # réplica local exatamente na ordem em que ele a propagou.
                 self.board.apply(msg["action"], msg["payload"], msg["client_id"])
                 self.on_board_update()
-
-            elif mtype == P.TX_ABORT:
-                self.on_status(f"Ação rejeitada: {msg.get('reason', '')}")
 
             elif mtype in (P.CLIENT_JOINED, P.CLIENT_LEFT):
                 self.members = msg["members"]
@@ -590,7 +577,7 @@ class Node:
         self.is_coordinator = True
         self.coord_ip, self.coord_port = self.my_ip, self.my_port
         # recupera o estado a partir da minha própria réplica (mantida em dia
-        # via TX_COMMIT) — satisfaz o requisito de recuperação de estado pelo
+        # via ACTION_APPLY) — satisfaz o requisito de recuperação de estado pelo
         # novo coordenador. Cópia profunda via serialização: evita que o
         # estado canônico e a réplica de cliente apontem para o mesmo objeto.
         self.coord_board = BoardState.from_dict(self.board.to_dict())
@@ -604,6 +591,14 @@ class Node:
             self.last_ack = {}
             self.next_client_id = (max((int(c) for c in self.members.keys()), default=0)) + 1
             members_snapshot = dict(self.members)
+
+        # Libera seleções presas de nós que não estão mais no quadro — em
+        # especial o coordenador que caiu e disparou esta eleição. As réplicas
+        # recebem o estado já limpo no STATE_SYNC ao reconectar a mim.
+        valid_ids = {int(c) for c in self.coord_members.keys()}
+        for obj in self.coord_board.objects.values():
+            if obj.get("selected_by") is not None and obj["selected_by"] not in valid_ids:
+                obj["selected_by"] = None
 
         threading.Thread(target=self._coord_heartbeat_loop, daemon=True).start()
 

@@ -2,10 +2,10 @@
 board_state.py — Estado do Quadro Branco (replicado em coordenador + clientes)
 ================================================================================
 Cada objeto do quadro é uma linha ou um quadrado, identificado por um id único.
-`validate()` é uma checagem somente-leitura (usada na fase de PREPARE do 2PC e
-para a checagem de exclusão mútua no coordenador). `apply()` muda o estado e é
-chamado depois que a transação foi confirmada (TX_COMMIT), tanto no coordenador
-quanto em cada réplica cliente.
+`validate()` é uma checagem somente-leitura (usada pelo coordenador para a
+exclusão mútua antes de aceitar uma ação). `apply()` muda o estado e é chamado
+quando a ação é confirmada pelo coordenador (ACTION_APPLY), tanto no estado
+canônico do coordenador quanto em cada réplica cliente.
 """
 
 from typing import Optional
@@ -111,6 +111,14 @@ class BoardState:
             return {"object_id": obj_id, "error": "objeto não existe mais"}
 
         if action == "SELECT":
+            # No máximo um objeto selecionado por cliente: ao selecionar um
+            # novo, libera automaticamente qualquer outro que este mesmo
+            # cliente já tivesse selecionado. Roda de forma idêntica no
+            # coordenador e em cada réplica (todas têm o mesmo estado prévio,
+            # pois SELECT/DESELECT passam pelo mesmo fluxo ordenado de commit).
+            for other_id, other in self.objects.items():
+                if other_id != obj_id and other.get("selected_by") == client_id:
+                    other["selected_by"] = None
             obj["selected_by"] = client_id
             return {"object_id": obj_id, "object": obj}
 
